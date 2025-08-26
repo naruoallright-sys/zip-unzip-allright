@@ -15,13 +15,10 @@ def unzip_endpoint():
         if not filedata_b64 or not password:
             return jsonify({"error": "filedata or password missing"}), 400
 
-        # Base64 をバイトに変換
         zip_bytes = base64.b64decode(filedata_b64)
         zip_buffer = io.BytesIO(zip_bytes)
 
-        # ZIP ファイルを開く
         with zipfile.ZipFile(zip_buffer) as zf:
-            # パスワードを bytes 型に変換
             pw_bytes = password.encode("utf-8")
             files_out = []
 
@@ -29,7 +26,6 @@ def unzip_endpoint():
                 if info.is_dir():
                     continue
                 try:
-                    # パスワードで解凍
                     with zf.open(info.filename, pwd=pw_bytes) as f:
                         file_bytes = f.read()
                         files_out.append({
@@ -45,5 +41,4 @@ def unzip_endpoint():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    # Render.com などクラウド環境では port=10000 を利用
     app.run(host="0.0.0.0", port=10000)
