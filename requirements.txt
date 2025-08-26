@@ -1,1 +1,2 @@
 Flask==2.3.3
+pyzipper==0.3.8
