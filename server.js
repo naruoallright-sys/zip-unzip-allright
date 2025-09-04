@@ -118,16 +118,19 @@ app.post("/upload/chunk", (req, res) => {
   const up = uploads.get(upload_id);
   if (!up) return res.status(400).json({ error: "invalid upload_id" });
 
-  // 最初のチャンクで totalChunks を必須に
   if (up.totalChunks == null) {
     if (typeof totalChunks !== "number" || totalChunks <= 0) {
       return res.status(400).json({ error: "totalChunks required on first chunk" });
     }
     up.totalChunks = totalChunks;
   }
-  // 範囲チェック
   if (index >= up.totalChunks) {
     return res.status(400).json({ error: "index out of range", totalChunks: up.totalChunks });
+  }
+
+  // ★ 空データは受け付けない（ネットワーク/プロキシ由来の欠落検知）
+  if (data.length === 0) {
+    return res.status(400).json({ error: "empty_chunk", index });
   }
 
   if (!up.parts[index]) {
@@ -136,24 +139,34 @@ app.post("/upload/chunk", (req, res) => {
   up.parts[index] = data;
   up.highestIndex = Math.max(up.highestIndex || 0, index);
 
-  return res.json({ ok: true, receivedCount: up.receivedCount || 1 });
+  // 受信長（Base64文字列長）を返す
+  return res.json({ ok: true, index, len: data.length, receivedCount: up.receivedCount || 1 });
 });
 
+// ====== /upload/finish（完全性チェック：欠落・空チャンク・size・sha256）======
 app.post("/upload/finish", async (req, res) => {
   const { upload_id, filename, size, sha256 } = req.body || {};
-  if (!upload_id || !filename) return res.status(400).json({ error: "invalid payload" });
-  const up = uploads.get(upload_id);
-  if (!up) return res.status(400).json({ error: "invalid upload_id" });
+  if (!upload_id || !filename) {
+    return res.status(400).json({ error: "invalid payload" });
+  }
 
+  const up = uploads.get(upload_id);
+  if (!up) {
+    return res.status(400).json({ error: "invalid upload_id" });
+  }
+
+  // totalChunks がセットされていない＝プロトコル違反
   if (typeof up.totalChunks !== "number" || up.totalChunks <= 0) {
     return res.status(409).json({ ok: false, error: "totalChunks_not_set" });
   }
   const expected = up.totalChunks;
 
-  // 欠落チェック
+  // 欠落チェック（undefined だけでなく "" の空データも欠落扱い）
   const missing = [];
   for (let i = 0; i < expected; i++) {
-    if (!up.parts[i]) missing.push(i);
+    if (!up.parts[i] || up.parts[i].length === 0) {
+      missing.push(i);
+    }
   }
   if (missing.length) {
     return res.status(422).json({
@@ -172,7 +185,7 @@ app.post("/upload/finish", async (req, res) => {
     const b64 = up.parts.join("");
     const buf = Buffer.from(b64, "base64");
 
-    // サイズ検証
+    // サイズ検証（任意だが推奨）
     if (typeof size === "number" && size !== buf.length) {
       return res.status(422).json({
         ok: false,
@@ -182,11 +195,17 @@ app.post("/upload/finish", async (req, res) => {
         expectedChunks: expected
       });
     }
-    // ハッシュ検証
+
+    // ハッシュ検証（強く推奨）
     if (typeof sha256 === "string" && sha256.length === 64) {
       const calc = crypto.createHash("sha256").update(buf).digest("hex");
       if (calc !== sha256) {
-        return res.status(422).json({ ok: false, error: "sha256_mismatch", got: calc, expect: sha256 });
+        return res.status(422).json({
+          ok: false,
+          error: "sha256_mismatch",
+          got: calc,
+          expect: sha256
+        });
       }
     }
 
