@@ -6,7 +6,7 @@
 // - /unzip/files で展開結果の一覧
 // - /unzip/download で1ファイルずつBase64取得
 //
-// ※GAS側は JSON Base64 前提。必要なら /unzip/download-binary 等を足してもOK。
+// 変更点：7zipバイナリを /tmp にコピーして noexec 回避（EACCES対応）
 
 import express from "express";
 import cors from "cors";
@@ -16,7 +16,6 @@ import fss from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
-import os from "os";
 import dotenv from "dotenv";
 import { path7za } from "7zip-bin";
 
@@ -27,22 +26,22 @@ const __dirname = path.dirname(__filename);
 
 // ====== 基本設定 ======
 const PORT = process.env.PORT || 3000;
-const TMP_DIR = process.env.TMP_DIR || path.join(process.cwd(), "tmp"); // 永続不要でOK
-const MAX_JSON_SIZE = process.env.MAX_JSON_SIZE || "10mb"; // 1チャンクあたり~2-5MB前提、余裕をみて
+const TMP_DIR = process.env.TMP_DIR || path.join(process.cwd(), "tmp"); // 一時格納
+const MAX_JSON_SIZE = process.env.MAX_JSON_SIZE || "10mb"; // 1チャンクあたりの最大JSON
 const ENABLE_CORS = process.env.ENABLE_CORS === "1";
-const API_KEY = process.env.API_KEY || ""; // 任意: セキュリティ用
+const API_KEY = process.env.API_KEY || ""; // 任意: x-api-key 認証
 
-// TTL（お掃除間隔）
+// TTL（自動掃除）
 const UPLOAD_TTL_MS = 60 * 60 * 1000; // 60分
 const JOB_TTL_MS = 6 * 60 * 60 * 1000; // 6時間
 
-// ====== メモリ管理 ======
+// ====== インメモリ管理 ======
 /**
  * uploads: upload_id -> {
  *   createdAt: number,
  *   parts: string[],      // Base64チャンク
  *   filename?: string,
- *   path?: string         // ZIP実体パス
+ *   path?: string         // ZIPファイルの実体パス
  * }
  *
  * jobs: job_id -> {
@@ -56,15 +55,34 @@ const JOB_TTL_MS = 6 * 60 * 60 * 1000; // 6時間
 const uploads = new Map();
 const jobs = new Map();
 
+// ====== 7za を /tmp にコピーして実行可にする（noexec 回避）======
+async function prepare7zaExecutable(tmpDir) {
+  const binDir = path.join(tmpDir, "bin");
+  const dst = path.join(binDir, "7za");
+  await fs.mkdir(binDir, { recursive: true });
+
+  // node_modules から /tmp/bin/7za へコピー
+  try {
+    await fs.copyFile(path7za, dst);
+  } catch (e) {
+    // すでに存在している場合は黙って進む
+    if (e.code !== "EEXIST") {
+      console.error("copy 7za error:", e);
+      throw e;
+    }
+  }
+  // 実行権限付与
+  await fs.chmod(dst, 0o755);
+  return dst;
+}
+
 // ====== 初期化 ======
 await fs.mkdir(TMP_DIR, { recursive: true });
+const EXEC_7Z_PATH = await prepare7zaExecutable(TMP_DIR); // ← これを使って spawn する
 
 const app = express();
 app.use(express.json({ limit: MAX_JSON_SIZE }));
-
-if (ENABLE_CORS) {
-  app.use(cors());
-}
+if (ENABLE_CORS) app.use(cors());
 
 // ====== APIキー認証（任意）=====
 app.use((req, res, next) => {
@@ -94,7 +112,7 @@ app.post("/upload/chunk", (req, res) => {
   const up = uploads.get(upload_id);
   if (!up) return res.status(400).json({ error: "invalid upload_id" });
 
-  up.parts[index] = data; // Base64をインデックス通りに格納
+  up.parts[index] = data; // インデックスに格納
   res.json({ ok: true });
 });
 
@@ -129,29 +147,28 @@ app.post("/unzip/start", async (req, res) => {
   const up = uploads.get(upload_id);
   if (!up || !up.path) return res.status(400).json({ error: "upload not ready" });
 
-  // ジョブ生成
   const job_id = uuid();
   const outDir = path.join(TMP_DIR, job_id);
   await fs.mkdir(outDir, { recursive: true });
   jobs.set(job_id, { status: "queued", createdAt: Date.now(), dir: outDir, files: [] });
 
-  // 非同期実行
+  // 非同期で解凍
   (async () => {
     try {
       jobs.get(job_id).status = "running";
-      // 7zip で解凍（AES対応）。パスワードなしなら -p を付けない。
       const args = password
         ? ["x", `-p${password}`, `-o${outDir}`, up.path]
         : ["x", `-o${outDir}`, up.path];
 
       await new Promise((resolve, reject) => {
-        const p = spawn(path7za, args);
+        const p = spawn(EXEC_7Z_PATH, args);
         let stderr = "";
         p.stderr.on("data", (d) => (stderr += d.toString()));
         p.on("close", (code) => {
           if (code === 0) resolve();
           else reject(new Error(`7z failed: code=${code}, stderr=${stderr}`));
         });
+        p.on("error", (err) => reject(err));
       });
 
       const names = await fs.readdir(outDir);
@@ -162,7 +179,7 @@ app.post("/unzip/start", async (req, res) => {
         if (st.isFile()) files.push({ name: n, size: st.size });
       }
       const job = jobs.get(job_id);
-      if (!job) return; // TTL清掃が走った等
+      if (!job) return; // TTL掃除等で消えていた場合
       job.files = files;
       job.status = "done";
     } catch (e) {
@@ -172,7 +189,7 @@ app.post("/unzip/start", async (req, res) => {
         job.error = e.message || String(e);
       }
     } finally {
-      // ※アップロード本体は不要になったら削除してOK（任意）
+      // アップロードZIPは不要になったら削除（任意）
       try {
         if (up?.path && fss.existsSync(up.path)) await fs.unlink(up.path);
       } catch (_) {}
@@ -217,7 +234,7 @@ app.get("/unzip/download", async (req, res) => {
   }
 });
 
-// ====== お掃除（TTLで古いものを削除） ======
+// ====== 自動掃除（TTL） ======
 async function cleanupOld() {
   const now = Date.now();
   // uploads
@@ -234,7 +251,6 @@ async function cleanupOld() {
     if (now - (job.createdAt || 0) > JOB_TTL_MS) {
       try {
         if (job.dir && fss.existsSync(job.dir)) {
-          // 中身を削除
           const entries = await fs.readdir(job.dir).catch(() => []);
           for (const n of entries) {
             const full = path.join(job.dir, n);
@@ -247,11 +263,12 @@ async function cleanupOld() {
     }
   }
 }
-setInterval(cleanupOld, 10 * 60 * 1000); // 10分おき
+setInterval(cleanupOld, 10 * 60 * 1000); // 10分ごと
 
 // ====== 起動 ======
 app.listen(PORT, () => {
   console.log(`server started on :${PORT}`);
   console.log(`TMP_DIR = ${TMP_DIR}`);
-  console.log(`7z path = ${path7za}`);
+  console.log(`7z module path = ${path7za}`);
+  console.log(`7z exec path = ${EXEC_7Z_PATH}`);
 });
