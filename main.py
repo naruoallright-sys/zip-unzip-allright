@@ -1,19 +1,20 @@
 from flask import Flask, request, jsonify
 import base64
 import io
+import os
+import json
 import pyzipper  # AES 暗号 ZIP に対応
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 app = Flask(__name__)
 
-# Google Drive API 認証設定
-# サービスアカウントキー (JSON) を Render に環境変数で埋め込む方式推奨
+# 環境変数からサービスアカウント情報を取得
+SERVICE_ACCOUNT_INFO = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT"])
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
-SERVICE_ACCOUNT_FILE = "service_account.json"  # Render にアップロード or 環境変数経由
 
-credentials = service_account.Credentials.from_service_account_file(
-    SERVICE_ACCOUNT_FILE, scopes=SCOPES
+credentials = service_account.Credentials.from_service_account_info(
+    SERVICE_ACCOUNT_INFO, scopes=SCOPES
 )
 drive_service = build("drive", "v3", credentials=credentials)
 
@@ -30,17 +31,12 @@ def unzip_endpoint():
     try:
         # Google Drive から ZIP ファイルをダウンロード
         request_drive = drive_service.files().get_media(fileId=file_id)
-        file_bytes = io.BytesIO()
-        downloader = build("drive", "v3", credentials=credentials)._http.request
-        response, content = downloader(request_drive.uri, "GET")
+        zip_bytes = request_drive.execute()  # バイト列で取得
 
-        if response.status != 200:
-            return jsonify({"error": f"Drive ダウンロード失敗: {response.status}"}), 500
-
-        zip_buffer = io.BytesIO(content)
+        zip_buffer = io.BytesIO(zip_bytes)
         extracted_files = []
 
-        # AES 暗号化 ZIP の解凍
+        # AES 暗号化 ZIP を解凍
         with pyzipper.AESZipFile(zip_buffer) as zf:
             zf.pwd = password.encode("utf-8")
             for info in zf.infolist():
