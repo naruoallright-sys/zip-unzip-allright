@@ -143,7 +143,7 @@ app.post("/upload/chunk", (req, res) => {
   return res.json({ ok: true, index, len: data.length, receivedCount: up.receivedCount || 1 });
 });
 
-// ====== /upload/finish（完全性チェック：欠落・空チャンク・size・sha256）======
+// ====== /upload/finish（ストリーミング結合：各チャンクを個別デコードして順次書き込み）======
 app.post("/upload/finish", async (req, res) => {
   const { upload_id, filename, size, sha256 } = req.body || {};
   if (!upload_id || !filename) {
@@ -155,13 +155,13 @@ app.post("/upload/finish", async (req, res) => {
     return res.status(400).json({ error: "invalid upload_id" });
   }
 
-  // totalChunks がセットされていない＝プロトコル違反
+  // totalChunks 必須
   if (typeof up.totalChunks !== "number" || up.totalChunks <= 0) {
     return res.status(409).json({ ok: false, error: "totalChunks_not_set" });
   }
   const expected = up.totalChunks;
 
-  // 欠落チェック（undefined だけでなく "" の空データも欠落扱い）
+  // 欠落チェック（undefined も "" も欠落扱い）
   const missing = [];
   for (let i = 0; i < expected; i++) {
     if (!up.parts[i] || up.parts[i].length === 0) {
@@ -182,15 +182,31 @@ app.post("/upload/finish", async (req, res) => {
     const zipPath = path.join(TMP_DIR, `${upload_id}.zip`);
     await fs.mkdir(path.dirname(zipPath), { recursive: true });
 
-    const b64 = up.parts.join("");
-    const buf = Buffer.from(b64, "base64");
+    // ★ ここが肝：チャンクごとに base64→Buffer へデコードし、順次ファイルへ書き込む
+    const out = fss.createWriteStream(zipPath, { flags: "w" });
+    const hasher = crypto.createHash("sha256");
+    let written = 0;
+
+    for (let i = 0; i < expected; i++) {
+      const b64 = up.parts[i];
+      const buf = Buffer.from(b64, "base64"); // ← 各チャンクを個別に復元
+      hasher.update(buf);
+      written += buf.length;
+
+      // write を await で直列化
+      await new Promise((resolve, reject) => {
+        out.write(buf, (err) => (err ? reject(err) : resolve()));
+      });
+    }
+    await new Promise((resolve, reject) => out.end(err => (err ? reject(err) : resolve())));
 
     // サイズ検証（任意だが推奨）
-    if (typeof size === "number" && size !== buf.length) {
+    if (typeof size === "number" && size !== written) {
+      // 期待サイズと実際に書いた合計バイトがズレていたらエラー
       return res.status(422).json({
         ok: false,
         error: "size_mismatch",
-        got: buf.length,
+        got: written,
         expect: size,
         expectedChunks: expected
       });
@@ -198,7 +214,7 @@ app.post("/upload/finish", async (req, res) => {
 
     // ハッシュ検証（強く推奨）
     if (typeof sha256 === "string" && sha256.length === 64) {
-      const calc = crypto.createHash("sha256").update(buf).digest("hex");
+      const calc = hasher.digest("hex");
       if (calc !== sha256) {
         return res.status(422).json({
           ok: false,
@@ -207,13 +223,19 @@ app.post("/upload/finish", async (req, res) => {
           expect: sha256
         });
       }
+    } else {
+      // sha256 を送っていない場合でも digest を消費しておく
+      hasher.digest("hex");
     }
 
-    await fs.writeFile(zipPath, buf);
+    // メタ更新＆後工程へ
     up.filename = filename;
     up.path = zipPath;
-    up.size = buf.length;
+    up.size = written;
     up.sha256 = sha256 || null;
+
+    // メモリ解放（任意）
+    up.parts = [];
 
     return res.json({ ok: true });
   } catch (e) {
