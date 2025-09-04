@@ -7,9 +7,8 @@
 // - /unzip/files で展開結果一覧
 // - /unzip/download で1ファイルずつBase64取得
 //
-// 特記事項：7zipバイナリを /tmp/bin にコピー＆chmod して noexec 回避（EACCES対策）
-// 認証：全エンドポイントで x-api-key を検査（.env の API_KEY）
-// 依存：express/cors/uuid/dotenv/7zip-bin
+// 特記事項：7zip バイナリを /tmp/bin にコピー＆chmod（noexec/EACCES 回避）
+// 認証：全エンドポイントで x-api-key を検査（/healthz は除外）
 
 import express from "express";
 import cors from "cors";
@@ -28,27 +27,29 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ====== 基本設定 ======
+// ====== 設定 ======
 const PORT = process.env.PORT || 3000;
-const TMP_DIR = process.env.TMP_DIR || path.join(process.cwd(), "tmp"); // 一時格納
-const MAX_JSON_SIZE = process.env.MAX_JSON_SIZE || "10mb"; // 1チャンクあたりの最大JSON
+const TMP_DIR = process.env.TMP_DIR || path.join(process.cwd(), "tmp");
+const MAX_JSON_SIZE = process.env.MAX_JSON_SIZE || "10mb";
 const ENABLE_CORS = process.env.ENABLE_CORS === "1";
-const API_KEY = process.env.API_KEY || ""; // 必須にするなら Render の Environment に設定
+const API_KEY = process.env.API_KEY || ""; // 必須
 
-// TTL（自動掃除）
+// TTL
 const UPLOAD_TTL_MS = 60 * 60 * 1000; // 60分
 const JOB_TTL_MS = 6 * 60 * 60 * 1000; // 6時間
 
-// ====== インメモリ管理 ======
+// ====== 状態 ======
 /**
  * uploads: upload_id -> {
  *   createdAt: number,
  *   parts: string[],      // Base64 チャンク（index順）
+ *   receivedCount?: number,
+ *   highestIndex?: number,
+ *   totalChunks?: number,
  *   filename?: string,
  *   path?: string,        // ZIP 実体パス
- *   totalChunks?: number,
- *   size?: number,        // 受信後の実サイズ
- *   sha256?: string       // 受信後のハッシュ
+ *   size?: number,
+ *   sha256?: string
  * }
  *
  * jobs: job_id -> {
@@ -62,12 +63,11 @@ const JOB_TTL_MS = 6 * 60 * 60 * 1000; // 6時間
 const uploads = new Map();
 const jobs = new Map();
 
-// ====== 7za を /tmp にコピーして実行可にする（noexec 回避）======
+// ====== 7za を /tmp/bin へコピー（実行権限付与）======
 async function prepare7zaExecutable(tmpDir) {
   const binDir = path.join(tmpDir, "bin");
   const dst = path.join(binDir, "7za");
   await fs.mkdir(binDir, { recursive: true });
-
   try {
     await fs.copyFile(path7za, dst);
   } catch (e) {
@@ -88,21 +88,18 @@ const app = express();
 app.use(express.json({ limit: MAX_JSON_SIZE }));
 if (ENABLE_CORS) app.use(cors());
 
-// ====== 認証（API_KEY 必須） ======
+// ヘルスチェック（無認証）
+app.get("/healthz", (req, res) => res.json({ ok: true }));
+
+// 認証（API_KEY 必須）
 app.use((req, res, next) => {
   if (!API_KEY) return res.status(500).json({ error: "server misconfigured: API_KEY not set" });
-  if (req.path === "/healthz") return next(); // ヘルスチェックは無認証にしたい場合
   const key = req.header("x-api-key");
   if (key === API_KEY) return next();
   return res.status(401).json({ error: "unauthorized" });
 });
 
-// ====== ヘルスチェック ======
-app.get("/healthz", (req, res) => {
-  res.json({ ok: true });
-});
-
-// ====== アップロード（分割） ======
+// ====== アップロード ======
 app.post("/upload/init", (req, res) => {
   const upload_id = uuid();
   uploads.set(upload_id, { createdAt: Date.now(), parts: [] });
@@ -110,16 +107,36 @@ app.post("/upload/init", (req, res) => {
 });
 
 app.post("/upload/chunk", (req, res) => {
-  const { upload_id, index, data, totalChunks } = req.body || {};
-  if (!upload_id || typeof index !== "number" || typeof data !== "string") {
+  let { upload_id, index, data, totalChunks } = req.body || {};
+  if (!upload_id || typeof data !== "string") {
     return res.status(400).json({ error: "invalid payload" });
+  }
+  index = Number(index);
+  if (!Number.isInteger(index) || index < 0) {
+    return res.status(400).json({ error: "invalid index" });
   }
   const up = uploads.get(upload_id);
   if (!up) return res.status(400).json({ error: "invalid upload_id" });
 
-  if (typeof totalChunks === "number") up.totalChunks = totalChunks;
-  up.parts[index] = data; // インデックスごとに格納
-  res.json({ ok: true });
+  // 最初のチャンクで totalChunks を必須に
+  if (up.totalChunks == null) {
+    if (typeof totalChunks !== "number" || totalChunks <= 0) {
+      return res.status(400).json({ error: "totalChunks required on first chunk" });
+    }
+    up.totalChunks = totalChunks;
+  }
+  // 範囲チェック
+  if (index >= up.totalChunks) {
+    return res.status(400).json({ error: "index out of range", totalChunks: up.totalChunks });
+  }
+
+  if (!up.parts[index]) {
+    up.receivedCount = (up.receivedCount || 0) + 1;
+  }
+  up.parts[index] = data;
+  up.highestIndex = Math.max(up.highestIndex || 0, index);
+
+  return res.json({ ok: true, receivedCount: up.receivedCount || 1 });
 });
 
 app.post("/upload/finish", async (req, res) => {
@@ -128,14 +145,24 @@ app.post("/upload/finish", async (req, res) => {
   const up = uploads.get(upload_id);
   if (!up) return res.status(400).json({ error: "invalid upload_id" });
 
-  // 欠落チャンク判定
-  const expected = typeof up.totalChunks === "number" ? up.totalChunks : up.parts.length;
+  if (typeof up.totalChunks !== "number" || up.totalChunks <= 0) {
+    return res.status(409).json({ ok: false, error: "totalChunks_not_set" });
+  }
+  const expected = up.totalChunks;
+
+  // 欠落チェック
   const missing = [];
   for (let i = 0; i < expected; i++) {
     if (!up.parts[i]) missing.push(i);
   }
   if (missing.length) {
-    return res.status(422).json({ ok: false, error: "missing_chunks", missing });
+    return res.status(422).json({
+      ok: false,
+      error: "missing_chunks",
+      missing,
+      receivedCount: up.receivedCount || 0,
+      expected
+    });
   }
 
   try {
@@ -145,11 +172,17 @@ app.post("/upload/finish", async (req, res) => {
     const b64 = up.parts.join("");
     const buf = Buffer.from(b64, "base64");
 
-    // サイズ検証（任意だが推奨）
+    // サイズ検証
     if (typeof size === "number" && size !== buf.length) {
-      return res.status(422).json({ ok: false, error: "size_mismatch", got: buf.length, expect: size });
+      return res.status(422).json({
+        ok: false,
+        error: "size_mismatch",
+        got: buf.length,
+        expect: size,
+        expectedChunks: expected
+      });
     }
-    // ハッシュ検証（強く推奨）
+    // ハッシュ検証
     if (typeof sha256 === "string" && sha256.length === 64) {
       const calc = crypto.createHash("sha256").update(buf).digest("hex");
       if (calc !== sha256) {
@@ -163,14 +196,14 @@ app.post("/upload/finish", async (req, res) => {
     up.size = buf.length;
     up.sha256 = sha256 || null;
 
-    res.json({ ok: true });
+    return res.json({ ok: true });
   } catch (e) {
     console.error("upload/finish error:", e);
-    res.status(500).json({ ok: false, error: "upload_finish_failed" });
+    return res.status(500).json({ ok: false, error: "upload_finish_failed" });
   }
 });
 
-// ====== 解凍ジョブ開始（非同期） ======
+// ====== 解凍ジョブ ======
 app.post("/unzip/start", async (req, res) => {
   const { upload_id, password } = req.body || {};
   if (!upload_id) return res.status(400).json({ error: "upload_id required" });
@@ -182,7 +215,6 @@ app.post("/unzip/start", async (req, res) => {
   await fs.mkdir(outDir, { recursive: true });
   jobs.set(job_id, { status: "queued", createdAt: Date.now(), dir: outDir, files: [] });
 
-  // 非同期で解凍
   (async () => {
     try {
       jobs.get(job_id).status = "running";
@@ -219,7 +251,6 @@ app.post("/unzip/start", async (req, res) => {
         job.error = e.message || String(e);
       }
     } finally {
-      // ZIP原本は不要なら削除（任意）
       try {
         if (up?.path && fss.existsSync(up.path)) await fs.unlink(up.path);
       } catch (_) {}
@@ -229,7 +260,6 @@ app.post("/unzip/start", async (req, res) => {
   res.json({ job_id });
 });
 
-// ====== ステータス ======
 app.get("/unzip/status", (req, res) => {
   const job_id = req.query.job_id;
   const job = job_id && jobs.get(job_id);
@@ -237,7 +267,6 @@ app.get("/unzip/status", (req, res) => {
   res.json({ status: job.status, error: job.error || null });
 });
 
-// ====== 展開ファイル一覧 ======
 app.get("/unzip/files", (req, res) => {
   const job_id = req.query.job_id;
   const job = job_id && jobs.get(job_id);
@@ -246,7 +275,6 @@ app.get("/unzip/files", (req, res) => {
   res.json({ files: job.files || [] });
 });
 
-// ====== 1ファイルDL（Base64 JSON） ======
 app.get("/unzip/download", async (req, res) => {
   const job_id = req.query.job_id;
   const name = req.query.name;
@@ -264,19 +292,15 @@ app.get("/unzip/download", async (req, res) => {
   }
 });
 
-// ====== 自動掃除（TTL） ======
+// ====== 自動掃除 ======
 async function cleanupOld() {
   const now = Date.now();
-  // uploads
   for (const [id, up] of uploads.entries()) {
     if (now - (up.createdAt || 0) > UPLOAD_TTL_MS) {
-      try {
-        if (up.path && fss.existsSync(up.path)) await fs.unlink(up.path);
-      } catch (_) {}
+      try { if (up.path && fss.existsSync(up.path)) await fs.unlink(up.path); } catch (_) {}
       uploads.delete(id);
     }
   }
-  // jobs
   for (const [id, job] of jobs.entries()) {
     if (now - (job.createdAt || 0) > JOB_TTL_MS) {
       try {
@@ -293,7 +317,7 @@ async function cleanupOld() {
     }
   }
 }
-setInterval(cleanupOld, 10 * 60 * 1000); // 10分ごと
+setInterval(cleanupOld, 10 * 60 * 1000);
 
 // ====== 起動 ======
 app.listen(PORT, () => {
